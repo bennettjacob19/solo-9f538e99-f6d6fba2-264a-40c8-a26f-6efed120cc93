@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地服务发现目录</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</head>
+<body>
+<header>
+  <h1>本地服务发现目录</h1>
+  <p class="sub">修改服务名到目标地址的映射，创建命名备份，并在需要时从备份恢复。</p>
+</header>
+
+<main>
+  {% if message %}<div class="flash ok" role="status">{{ message }}</div>{% endif %}
+  {% if error %}<div class="flash bad" role="alert">{{ error }}</div>{% endif %}
+
+  {% if state.restore.state == 'restoring' %}
+  <div class="flash warn" role="alert">
+    正在从备份 <strong>{{ state.restore.backup }}</strong> 恢复。
+    此期间查询仍返回当前完整目录，新的修改会被拒绝。
+  </div>
+  {% endif %}
+
+  <section class="card">
+    <h2>当前目录 <span class="badge">版本 {{ state.version }} · {{ state.count }} 项</span></h2>
+    {% if state.services %}
+    <table>
+      <thead><tr><th>服务名</th><th>目标地址</th><th></th></tr></thead>
+      <tbody>
+      {% for row in state.services %}
+        <tr>
+          <td class="mono">{{ row.service }}</td>
+          <td class="mono">{{ row.address }}</td>
+          <td class="right">
+            <form method="post" action="{{ url_for('form_delete', service=row.service) }}"
+                  data-confirm="确认删除 {name}？" data-name="{{ row.service }}">
+              <button class="danger" type="submit">删除</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">目录为空。请在下方添加服务。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>新增 / 修改服务</h2>
+    <form method="post" action="{{ url_for('form_upsert') }}" class="grid">
+      <label>服务名
+        <input name="service" required maxlength="128" placeholder="orders-api">
+      </label>
+      <label>目标地址
+        <input name="address" required maxlength="512" placeholder="10.0.0.12:8080">
+      </label>
+      <label>备注（可选）
+        <input name="note" maxlength="200" placeholder="变更原因">
+      </label>
+      <button type="submit">保存</button>
+    </form>
+  </section>
+
+  <section class="card">
+    <h2>命名备份</h2>
+    <form method="post" action="{{ url_for('form_create_backup') }}" class="inline">
+      <input name="name" required maxlength="64" placeholder="例如 pre-change-2026-11-18">
+      <button type="submit">创建备份</button>
+    </form>
+    <p class="muted small">
+      备份在创建时固定一个完整的目录版本，之后的修改不会影响它。
+    </p>
+
+    {% if state.backups %}
+    <table>
+      <thead><tr><th>名称</th><th>目录版本</th><th>条目</th><th>创建时间</th><th>摘要</th><th></th></tr></thead>
+      <tbody>
+      {% for b in state.backups %}
+        <tr>
+          <td class="mono">{{ b.name }}</td>
+          <td>{{ b.version }}</td>
+          <td>{{ b.entry_count }}</td>
+          <td class="mono small">{{ b.created_at }}</td>
+          <td class="mono small" title="{{ b.digest }}">{{ b.digest[:12] }}…</td>
+          <td class="right">
+            <form method="post" action="{{ url_for('form_restore_backup', name=b.name) }}"
+                  data-confirm="从备份 {name} 恢复？当前目录会被替换。" data-name="{{ b.name }}">
+              <button type="submit">恢复</button>
+            </form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">尚无备份。</p>
+    {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>查询 API</h2>
+    <p class="mono small">GET /resolve?name=&lt;服务名&gt; &nbsp;·&nbsp; GET /resolve（返回整个目录）</p>
+  </section>
+</main>
+</body>
+</html>

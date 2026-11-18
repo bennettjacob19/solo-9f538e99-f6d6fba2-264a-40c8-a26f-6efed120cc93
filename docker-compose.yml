@@ -1,0 +1,16 @@
+services:
+  svcdir:
+    build: .
+    image: svcdir:local
+    container_name: svcdir
+    ports:
+      - "8000:8000"
+    environment:
+      SVCDIR_DB: /data/directory.sqlite3
+      SVCDIR_RESTORE_LEASE_SECONDS: "30"
+    volumes:
+      - svcdir-data:/data
+    restart: unless-stopped
+
+volumes:
+  svcdir-data:
