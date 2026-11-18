@@ -28,12 +28,16 @@
     <h2>当前目录 <span class="badge">版本 {{ state.version }} · {{ state.count }} 项</span></h2>
     {% if state.services %}
     <table>
-      <thead><tr><th>服务名</th><th>目标地址</th><th></th></tr></thead>
+      <thead><tr><th>服务名</th><th>目标地址</th><th>连通性核验</th><th></th></tr></thead>
       <tbody>
       {% for row in state.services %}
-        <tr>
+        <tr data-service="{{ row.service }}">
           <td class="mono">{{ row.service }}</td>
           <td class="mono">{{ row.address }}</td>
+          <td class="probe-cell">
+            <button type="button" class="probe-btn" data-service="{{ row.service }}">核验</button>
+            <div class="probe-result" data-result-for="{{ row.service }}" aria-live="polite"></div>
+          </td>
           <td class="right">
             <form method="post" action="{{ url_for('form_delete', service=row.service) }}"
                   data-confirm="确认删除 {name}？" data-name="{{ row.service }}">
@@ -99,6 +103,22 @@
     {% else %}
     <p class="muted">尚无备份。</p>
     {% endif %}
+  </section>
+
+  <section class="card">
+    <h2>连通性核验说明</h2>
+    <p class="muted small">
+      点击服务行的「核验」后，系统在后台对当前发布的 <span class="mono">host:port</span>
+      发起限时 2 秒的 <span class="mono">HTTP GET /healthz</span>，页面展示所测地址、
+      发起核验时的目录版本以及结果：HTTP 200、非 200、连接失败、超时或地址不可探测。
+      核验期间目录编辑、备份恢复和 <span class="mono">/resolve</span> 查询照常可用，
+      核验结果不影响 <span class="mono">/resolve</span> 的选址。
+    </p>
+    <p class="muted small">
+      若服务改址、删后重建或从备份恢复（即使地址再次相同），旧结果只会标记为「已过期」，
+      不再代表当前状态；对同一服务连续发起核验时，只展示最新一次任务的结果。
+      进程重启后，未完成的核验标记为「中断」，已完成记录仍可查看。
+    </p>
   </section>
 
   <section class="card">

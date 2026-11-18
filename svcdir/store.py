@@ -56,6 +56,16 @@ MAX_SERVICES = 5000
 MAX_ADDRESS_LENGTH = 512
 MAX_BACKUP_NAME_LENGTH = 64
 MAX_NOTE_LENGTH = 200
+MAX_PROBE_DETAIL_LENGTH = 500
+PROBE_HISTORY_PER_SERVICE = 50
+
+# Probe lifecycle statuses.  ``running`` is the only non-terminal one; on
+# restart every leftover ``running`` row is reclassified as ``interrupted``.
+PROBE_STATUS_RUNNING = "running"
+PROBE_STATUS_INTERRUPTED = "interrupted"
+PROBE_TERMINAL_STATUSES = frozenset(
+    {"ok_200", "bad_status", "connect_failed", "timeout", "unprobeable", "interrupted"}
+)
 
 SERVICE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 DIGEST_RE = re.compile(r"[0-9a-f]{64}\Z")
@@ -274,6 +284,7 @@ class DirectoryStore:
                 raise _translate_db_error(exc) from exc
             try:
                 self._create_or_check_schema(conn)
+                self._ensure_probe_table(conn)
                 conn.execute("COMMIT")
             except BaseException as exc:
                 with contextlib.suppress(sqlite3.Error):
@@ -288,6 +299,32 @@ class DirectoryStore:
         # A previous process may have died mid-restore.  Its lease is either
         # still live (another worker owns it) or expired and safe to reclaim.
         self.recover_stale_restore()
+        # Probe workers that never got to persist a result cannot outlive the
+        # process (in-memory thread pool): mark every open probe interrupted.
+        self.recover_interrupted_probes()
+
+    def _ensure_probe_table(self, conn: sqlite3.Connection) -> None:
+        """Create the probes table on databases built before probes existed."""
+        if conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='probes'"
+        ).fetchone():
+            return
+        conn.execute(
+            """
+            CREATE TABLE probes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service TEXT NOT NULL,
+                address TEXT NOT NULL,
+                version_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                status_code INTEGER,
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            )
+            """
+        )
+        conn.execute("CREATE INDEX idx_probes_service_id ON probes(service, id)")
 
     def _create_or_check_schema(self, conn: sqlite3.Connection) -> None:
         has_meta = conn.execute(
@@ -337,6 +374,24 @@ class DirectoryStore:
                 entry_count INTEGER NOT NULL
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE probes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service TEXT NOT NULL,
+                address TEXT NOT NULL,
+                version_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                status_code INTEGER,
+                detail TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                finished_at TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX idx_probes_service_id ON probes(service, id)"
         )
         now = _utc_now_iso()
         cur = conn.execute(
@@ -551,6 +606,7 @@ class DirectoryStore:
             version = self._current_version(conn)
             rows = self._entries(conn, version)
             restore = self._restore_summary(conn)
+            probes = self._latest_probes(conn, version)
             backups = [
                 {
                     "name": str(r["name"]),
@@ -571,6 +627,7 @@ class DirectoryStore:
                 {"service": s, "address": a} for s, a in rows
             ],
             "restore": restore,
+            "probes": probes,
             "backups": backups,
         }
 
@@ -578,6 +635,187 @@ class DirectoryStore:
         self._ensure_ready()
         with self._txn(write=False) as conn:
             conn.execute("SELECT 1")
+
+    # -- connectivity probes ----------------------------------------------
+
+    @staticmethod
+    def _probe_row_to_dict(row: sqlite3.Row, current_version: int) -> dict:
+        service = str(row["service"])
+        version_id = int(row["version_id"])
+        address = str(row["address"])
+        current = conn_address = None
+        # Freshness is evaluated at read time: a probe only represents the
+        # live directory if the published version never moved and the service
+        # still publishes exactly the probed address.  Any edit, delete +
+        # recreate or restore bumps current_version, so even an identical
+        # address is then reported as expired.
+        fresh = version_id == current_version
+        return {
+            "id": int(row["id"]),
+            "service": service,
+            "address": address,
+            "version": version_id,
+            "status": str(row["status"]),
+            "status_code": None if row["status_code"] is None else int(row["status_code"]),
+            "detail": str(row["detail"]),
+            "created_at": str(row["created_at"]),
+            "finished_at": None if row["finished_at"] is None else str(row["finished_at"]),
+            "fresh": fresh,
+        }
+
+    def _latest_probes(self, conn: sqlite3.Connection, current_version: int) -> list[dict]:
+        rows = conn.execute(
+            """
+            SELECT p.* FROM probes p
+            JOIN (
+                SELECT service, MAX(id) AS max_id
+                FROM probes GROUP BY service
+            ) latest ON latest.max_id = p.id
+            ORDER BY p.service
+            """
+        ).fetchall()
+        live_addresses = dict(self._entries(conn, current_version))
+        probes: list[dict] = []
+        for row in rows:
+            item = self._probe_row_to_dict(row, current_version)
+            live_address = live_addresses.get(item["service"])
+            if live_address is None or live_address != item["address"]:
+                item["fresh"] = False
+            probes.append(item)
+        return probes
+
+    def list_latest_probes(self) -> list[dict]:
+        """One record per service: only the most recently started probe."""
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            return self._latest_probes(conn, self._current_version(conn))
+
+    def get_probe(self, probe_id: Any) -> dict | None:
+        try:
+            pid = int(probe_id)
+        except (TypeError, ValueError):
+            return None
+        self._ensure_ready()
+        with self._txn(write=False) as conn:
+            row = conn.execute("SELECT * FROM probes WHERE id=?", (pid,)).fetchone()
+            if row is None:
+                return None
+            item = self._probe_row_to_dict(row, self._current_version(conn))
+            live = conn.execute(
+                "SELECT address FROM entries WHERE version_id=? AND service=?",
+                (self._current_version(conn), item["service"]),
+            ).fetchone()
+            if live is None or str(live["address"]) != item["address"]:
+                item["fresh"] = False
+        return item
+
+    def create_probe(self, service: Any) -> dict:
+        """Register a probe against the currently published address.
+
+        Probe insertion is allowed while a restore is in progress: it only
+        reads the live version and never edits directory data, so it cannot
+        block or be blocked by restore semantics.
+        """
+        svc = validate_service_name(service)
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            version = self._current_version(conn)
+            row = conn.execute(
+                "SELECT address FROM entries WHERE version_id=? AND service=?",
+                (version, svc),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(f"未知服务: {svc}")
+            address = str(row["address"])
+            created_at = _utc_now_iso()
+            cur = conn.execute(
+                "INSERT INTO probes(service, address, version_id, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (svc, address, version, PROBE_STATUS_RUNNING, created_at),
+            )
+            probe_id = int(cur.lastrowid)
+            # Bound per-service history so an operator clicking repeatedly
+            # cannot grow the table without limit.
+            stale_ids = [
+                int(r["id"])
+                for r in conn.execute(
+                    "SELECT id FROM probes WHERE service=? ORDER BY id DESC "
+                    "LIMIT -1 OFFSET ?",
+                    (svc, PROBE_HISTORY_PER_SERVICE),
+                ).fetchall()
+            ]
+            if stale_ids:
+                conn.execute(
+                    f"DELETE FROM probes WHERE id IN ({','.join('?' * len(stale_ids))})",
+                    stale_ids,
+                )
+        return {
+            "id": probe_id,
+            "service": svc,
+            "address": address,
+            "version": version,
+            "status": PROBE_STATUS_RUNNING,
+            "status_code": None,
+            "detail": "",
+            "created_at": created_at,
+            "finished_at": None,
+            "fresh": True,
+        }
+
+    def finish_probe(
+        self,
+        probe_id: Any,
+        *,
+        status: str,
+        status_code: Any = None,
+        detail: str = "",
+    ) -> dict:
+        try:
+            pid = int(probe_id)
+        except (TypeError, ValueError) as exc:
+            raise InputError("核验任务 id 必须是整数") from exc
+        if status not in PROBE_TERMINAL_STATUSES:
+            raise InputError(f"未知的核验结果状态: {status}")
+        code: int | None = None
+        if status_code is not None:
+            try:
+                code = int(status_code)
+            except (TypeError, ValueError) as exc:
+                raise InputError("HTTP 状态码必须是整数") from exc
+            if not (100 <= code <= 599):
+                raise InputError("HTTP 状态码超出范围")
+        clean_detail = str(detail or "")[:MAX_PROBE_DETAIL_LENGTH]
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            row = conn.execute("SELECT * FROM probes WHERE id=?", (pid,)).fetchone()
+            if row is None:
+                raise NotFoundError(f"核验任务不存在: {pid}")
+            if str(row["status"]) != PROBE_STATUS_RUNNING:
+                # A restart may have marked this row interrupted while the
+                # old worker was still shutting down: never resurrect it.
+                raise ConflictError("核验任务已结束，结果不能再更新", code="probe_closed")
+            finished_at = _utc_now_iso()
+            conn.execute(
+                "UPDATE probes SET status=?, status_code=?, detail=?, finished_at=? "
+                "WHERE id=?",
+                (status, code, clean_detail, finished_at, pid),
+            )
+        return self.get_probe(pid)  # type: ignore[return-value]
+
+    def recover_interrupted_probes(self) -> int:
+        """Reclassify every still-open probe after a process (re)start."""
+        self._ensure_ready()
+        with self._txn(write=True) as conn:
+            cur = conn.execute(
+                "UPDATE probes SET status=?, finished_at=? "
+                "WHERE status=?",
+                (
+                    PROBE_STATUS_INTERRUPTED,
+                    _utc_now_iso(),
+                    PROBE_STATUS_RUNNING,
+                ),
+            )
+            return int(cur.rowcount)
 
     @contextlib.contextmanager
     def read_view(self):

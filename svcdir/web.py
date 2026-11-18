@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import atexit
 import os
 from pathlib import Path
 
 from flask import Flask, jsonify, redirect, render_template, request, url_for
 
-from .errors import DirectoryError, InputError
+from .errors import DirectoryError, InputError, NotFoundError
+from .probing import ProbeManager
 from .store import DirectoryStore
 
 
@@ -17,7 +19,19 @@ def _store_from_env() -> DirectoryStore:
     return DirectoryStore(db_path, restore_lease_seconds=lease)
 
 
-def create_app(store: DirectoryStore | None = None, *, config: dict | None = None) -> Flask:
+def _probe_workers_from_env() -> int:
+    try:
+        return max(1, min(32, int(os.environ.get("SVCDIR_PROBE_WORKERS", "8"))))
+    except ValueError:
+        return 8
+
+
+def create_app(
+    store: DirectoryStore | None = None,
+    *,
+    config: dict | None = None,
+    probe_manager: ProbeManager | None = None,
+) -> Flask:
     app = Flask(__name__)
     app.config.update(
         SVCDIR_TESTING=False,
@@ -29,7 +43,14 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     app.json.sort_keys = False
     store = store or _store_from_env()
     app.extensions["svcdir"] = store
+    # initialize() also reclassifies probes left "running" by a dead process.
     store.initialize()
+    owns_manager = probe_manager is None
+    if probe_manager is None:
+        probe_manager = ProbeManager(store, max_workers=_probe_workers_from_env())
+    app.extensions["svcdir_probes"] = probe_manager
+    if owns_manager:
+        atexit.register(probe_manager.shutdown)
 
     @app.after_request
     def security_headers(response):
@@ -160,6 +181,27 @@ def create_app(store: DirectoryStore | None = None, *, config: dict | None = Non
     def api_restore_backup(name: str):
         result = store.restore_backup(name)
         return jsonify({"ok": True, **result})
+
+    # -- connectivity probes ----------------------------------------------
+
+    @app.get("/api/probes")
+    def api_list_probes():
+        return jsonify({"ok": True, "probes": store.list_latest_probes()})
+
+    @app.post("/api/services/<path:service>/probes")
+    def api_create_probe(service: str):
+        # The probe runs in the ProbeManager's thread pool; this request only
+        # registers the task and returns immediately, so directory editing,
+        # backup/restore and /resolve stay available while it is in flight.
+        record = probe_manager.start(service)
+        return jsonify({"ok": True, "probe": record}), 202
+
+    @app.get("/api/services/<path:service>/probes/latest")
+    def api_latest_probe(service: str):
+        for probe in store.list_latest_probes():
+            if probe["service"] == service:
+                return jsonify({"ok": True, "probe": probe})
+        raise NotFoundError(f"服务 {service} 暂无核验记录")
 
     # -- HTML -------------------------------------------------------------
 

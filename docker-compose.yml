@@ -8,6 +8,7 @@ services:
     environment:
       SVCDIR_DB: /data/directory.sqlite3
       SVCDIR_RESTORE_LEASE_SECONDS: "30"
+      SVCDIR_PROBE_WORKERS: "8"
     volumes:
       - svcdir-data:/data
     restart: unless-stopped
